@@ -67,9 +67,10 @@ host, nothing else is needed.
 ### Run the full durable stack
 
 ```bash
-cp .env.example .env               # replace REPLACE_WITH_* values; match `SKYNET_DB_USER` and `SKYNET_DB_PASSWORD` in `SKYNET_MEMORY__DSN`
-# LANGFUSE_ENCRYPTION_KEY must be 64 hex characters; use unique values for every secret
-# For host-side Postgres runs, set SKYNET_MEMORY__DSN; Compose builds its internal DSN automatically.
+cp .env.example .env
+# Replace every REPLACE_WITH_* value with unique credentials before starting Compose.
+# LANGFUSE_ENCRYPTION_KEY must be 64 hexadecimal characters.
+# For host-side Postgres, set SKYNET_MEMORY__DSN; Compose builds its internal DSN automatically.
 docker compose up -d --build
 
 curl -XPOST localhost:8000/v1/runs -H 'Content-Type: application/json' \
