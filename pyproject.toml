@@ -1,0 +1,81 @@
+[project]
+name = "skynet"
+version = "0.1.0"
+description = "A general-purpose agent harness / agent runtime"
+readme = "README.md"
+authors = [
+    { name = "om_parab", email = "omparab@benchmarkit.solutions" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.12",
+    "pydantic-settings>=2.15",
+    "httpx>=0.28",
+    "pyyaml>=6.0",
+    "typer>=0.15",
+]
+
+[project.optional-dependencies]
+temporal = ["temporalio>=1.31"]
+api = ["fastapi>=0.141", "uvicorn[standard]>=0.52", "sse-starlette>=2.1"]
+storage = ["minio>=7.2"]
+postgres = ["psycopg[binary,pool]>=3.2", "pgvector>=0.3"]
+sandbox = ["docker>=7.2"]
+langfuse = ["langfuse>=4.14"]
+all = [
+    "temporalio>=1.31",
+    "fastapi>=0.141",
+    "uvicorn[standard]>=0.52",
+    "sse-starlette>=2.1",
+    "minio>=7.2",
+    "docker>=7.2",
+    "langfuse>=4.14",
+    "psycopg[binary,pool]>=3.2",
+    "pgvector>=0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[project.scripts]
+skynet = "skynet.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires external infrastructure (Docker, Temporal, MinIO)",
+]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# The core must not know which technologies exist. Adapters, the composition
+# root and tests are the places that legitimately do, so they are exempt below.
+"skynet.adapters".msg = "Core layers must not import adapters; wire them in config/container.py."
+
+[tool.ruff.lint.per-file-ignores]
+"src/skynet/adapters/**" = ["TID251"]
+"src/skynet/config/**" = ["TID251"]
+"src/skynet/api/**" = ["TID251"]
+"tests/**" = ["TID251"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true

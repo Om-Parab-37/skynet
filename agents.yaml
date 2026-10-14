@@ -1,0 +1,87 @@
+# Agent definitions.
+#
+# Agents are configuration, not code: adding one here needs no change to the
+# runtime. `tools` is an explicit allowlist and `permissions` is the authority
+# a run starts with -- a sub-agent can only ever receive a subset of its
+# parent's grants.
+#
+# The optional `memory:` block is per-agent policy. Memory is private by
+# default: an agent always reads its own run and agent scopes, and reads a
+# shared project or user scope only where that is granted here.
+#
+#   auto_recall     retrieve before the first model call
+#   recall_limit    how many memories reach the prompt
+#   consolidate     write down what the run learned, before it completes
+#   reflect_every   iterations between reflections (0 = off)
+#   share_project   read (and with write_level, write) the project scope
+#   write_level     run | agent | project | user
+#   model           a cheaper model for memory work
+
+agents:
+  assistant:
+    description: General-purpose agent with code execution and a filesystem.
+    prompt: skynet/agent
+    tools: [python_exec, terminal, read_file, write_file, memory_write, memory_search]
+    permissions: [code_exec, terminal, filesystem, memory:read, memory:write]
+    memory:
+      auto_recall: true
+      recall_limit: 8
+      consolidate: true
+    limits:
+      max_iterations: 12
+      max_tool_calls: 30
+
+  supervisor:
+    description: Coordinates work and delegates focused questions to researchers.
+    prompt: skynet/agent
+    tools: [python_exec, delegate, memory_write, memory_search]
+    sub_agents: [researcher]
+    permissions: [code_exec, spawn_agent, memory:read, memory:write]
+    memory:
+      # Shares a project scope with the researchers it delegates to, so a
+      # finding surfaced by one is available to the next.
+      auto_recall: true
+      consolidate: true
+      share_project: true
+      project: skynet
+      write_level: project
+    limits:
+      max_iterations: 10
+      max_depth: 2
+
+  researcher:
+    description: Answers one focused question and reports back.
+    prompt: skynet/researcher
+    tools: [python_exec, memory_search]
+    permissions: [code_exec, memory:read]
+    memory:
+      # Reads the shared project scope but writes nowhere: a focused sub-agent
+      # answering one question has no business editing shared memory.
+      auto_recall: true
+      share_project: true
+      project: skynet
+    limits:
+      max_iterations: 6
+
+  analyst:
+    description: >-
+      Full-capability agent: computes, writes and reads files, remembers
+      findings, and delegates focused questions. Used to exercise the whole
+      capability surface in one run.
+    prompt: skynet/agent
+    tools:
+      [python_exec, terminal, read_file, write_file, memory_write,
+       memory_search, delegate]
+    sub_agents: [researcher]
+    permissions:
+      [code_exec, terminal, filesystem, memory:read, memory:write, spawn_agent]
+    memory:
+      auto_recall: true
+      consolidate: true
+      reflect_every: 6
+      share_project: true
+      project: skynet
+    limits:
+      max_iterations: 20
+      max_tool_calls: 40
+      max_depth: 2

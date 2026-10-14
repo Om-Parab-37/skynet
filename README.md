@@ -67,7 +67,9 @@ host, nothing else is needed.
 ### Run the full durable stack
 
 ```bash
-cp .env.example .env               # then set SKYNET_MODEL__API_KEY if using OpenRouter
+cp .env.example .env               # replace REPLACE_WITH_* values; match `SKYNET_DB_USER` and `SKYNET_DB_PASSWORD` in `SKYNET_MEMORY__DSN`
+# LANGFUSE_ENCRYPTION_KEY must be 64 hex characters; use unique values for every secret
+# For host-side Postgres runs, set SKYNET_MEMORY__DSN; Compose builds its internal DSN automatically.
 docker compose up -d --build
 
 curl -XPOST localhost:8000/v1/runs -H 'Content-Type: application/json' \
@@ -78,7 +80,7 @@ curl -N localhost:8000/v1/runs/<run_id>/stream    # live server-sent events
 
 - API — <http://localhost:8000/docs>
 - Temporal UI — <http://localhost:8233>
-- MinIO console — <http://localhost:9001> (`minioadmin` / `minioadmin`)
+- MinIO console — <http://localhost:9001> (use the credentials configured in `.env`)
 
 Optional profiles, both off by default:
 
@@ -95,8 +97,7 @@ nothing to click through:
 | | |
 |---|---|
 | UI | <http://localhost:3000> |
-| Login | `admin@skynet.local` / `skynet-admin-password` |
-| Keys | `pk-lf-skynet-local` / `sk-lf-skynet-local` |
+| Login and API keys | Configure unique credentials in `.env` before starting the profile |
 
 Then enable it and publish the prompts:
 
@@ -400,4 +401,3 @@ are hidden:
 - **Small free models wander.** The budget system stops them (`max_iterations`
   is enforced as a `Decision`, so it is visible in the log), but output quality
   tracks the model you point it at.
-

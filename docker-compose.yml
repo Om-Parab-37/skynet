@@ -1,0 +1,370 @@
+# Local development stack.
+#
+# `docker compose up` brings up the minimum needed to run durable agents:
+# Temporal, Postgres, MinIO, the worker and the API. Langfuse is heavy (six more
+# containers) so it lives behind a profile and is off by default -- the runtime
+# falls back to a console tracer and version-controlled YAML prompts, and starts
+# either way.
+#
+# Nothing here is assumed by the code: every service is reached through an
+# environment variable, so this file is one deployment shape among several.
+
+name: skynet
+
+x-skynet-env: &skynet-env
+  SKYNET_MODEL__PROVIDER: ${SKYNET_MODEL__PROVIDER:-ollama}
+  SKYNET_MODEL__NAME: ${SKYNET_MODEL__NAME:-qwen3.5:9b}
+  SKYNET_MODEL__BASE_URL: ${SKYNET_MODEL__BASE_URL:-http://host.docker.internal:11434/v1}
+  SKYNET_MODEL__API_KEY: ${SKYNET_MODEL__API_KEY:-}
+  SKYNET_PROMPTS__DIRECTORY: prompts
+  SKYNET_PROMPTS__USE_LANGFUSE: ${SKYNET_PROMPTS__USE_LANGFUSE:-false}
+  SKYNET_TRACING__BACKEND: ${SKYNET_TRACING__BACKEND:-console}
+  SKYNET_LANGFUSE__HOST: ${SKYNET_LANGFUSE__HOST:-http://langfuse-web:3000}
+  SKYNET_LANGFUSE__PUBLIC_KEY: ${SKYNET_LANGFUSE__PUBLIC_KEY:?}
+  SKYNET_LANGFUSE__SECRET_KEY: ${SKYNET_LANGFUSE__SECRET_KEY:?}
+  SKYNET_STORAGE__BACKEND: ${SKYNET_STORAGE__BACKEND:-minio}
+  SKYNET_STORAGE__ENDPOINT: minio:9000
+  SKYNET_STORAGE__ACCESS_KEY: ${SKYNET_STORAGE__ACCESS_KEY:?}
+  SKYNET_STORAGE__SECRET_KEY: ${SKYNET_STORAGE__SECRET_KEY:?}
+  SKYNET_STORAGE__BUCKET: ${SKYNET_STORAGE__BUCKET:-skynet}
+  SKYNET_MEMORY__BACKEND: ${SKYNET_MEMORY__BACKEND:-postgres}
+      SKYNET_MEMORY__DSN: postgresql://${SKYNET_DB_USER:?}:${SKYNET_DB_PASSWORD:?}@memory-db:5432/skynet_memory
+  SKYNET_EMBEDDING__BACKEND: ${SKYNET_EMBEDDING__BACKEND:-hashing}
+  SKYNET_EMBEDDING__MODEL: ${SKYNET_EMBEDDING__MODEL:-nomic-embed-text}
+  SKYNET_EMBEDDING__BASE_URL: ${SKYNET_EMBEDDING__BASE_URL:-http://host.docker.internal:11434}
+  SKYNET_EMBEDDING__API_KEY: ${SKYNET_EMBEDDING__API_KEY:-}
+  SKYNET_EMBEDDING__DIMENSIONS: ${SKYNET_EMBEDDING__DIMENSIONS:-768}
+  SKYNET_EXECUTION__ENGINE: ${SKYNET_EXECUTION__ENGINE:-temporal}
+  SKYNET_TEMPORAL__HOST: temporal:7233
+  SKYNET_TEMPORAL__NAMESPACE: default
+  SKYNET_TEMPORAL__TASK_QUEUE: ${SKYNET_TEMPORAL__TASK_QUEUE:-skynet-agents}
+  SKYNET_EXECUTION__EVENT_LOG_DIR: /var/lib/skynet/events
+  SKYNET_LOG_LEVEL: ${SKYNET_LOG_LEVEL:-INFO}
+
+services:
+  # ------------------------------------------------------------ application
+  api:
+    build: .
+    image: skynet:local
+    environment:
+      <<: *skynet-env
+      # The API never spawns sandboxes; only the worker executes tools.
+      SKYNET_SANDBOX__BACKEND: local
+    ports:
+      - "${SKYNET_API_PORT:-8000}:8000"
+    volumes:
+      # The worker writes the run event log here; the API reads and streams it.
+      - run-events:/var/lib/skynet/events
+      - ./agents.yaml:/app/agents.yaml:ro
+      - ./prompts:/app/prompts:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      memory-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    # Same image as the API -- built once by the `api` service above. Declaring
+    # the build twice makes both services race to write the same tag.
+    image: skynet:local
+    pull_policy: never
+    command: ["python", "-m", "skynet.adapters.temporal.worker"]
+    environment:
+      <<: *skynet-env
+      SKYNET_SANDBOX__BACKEND: ${SKYNET_SANDBOX__BACKEND:-docker}
+      SKYNET_SANDBOX__IMAGE: ${SKYNET_SANDBOX__IMAGE:-python:3.13-slim}
+      SKYNET_SANDBOX__MEMORY_MB: ${SKYNET_SANDBOX__MEMORY_MB:-512}
+      SKYNET_SANDBOX__CPUS: ${SKYNET_SANDBOX__CPUS:-1.0}
+      SKYNET_SANDBOX__NETWORK: ${SKYNET_SANDBOX__NETWORK:-false}
+    volumes:
+      # The worker creates a throwaway container per sandbox. This grants it
+      # control of the host's Docker daemon -- acceptable for local development,
+      # and the reason the Sandbox port exists so a rootless or remote runtime
+      # can replace it without touching the runtime.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - run-events:/var/lib/skynet/events
+      - ./agents.yaml:/app/agents.yaml:ro
+      - ./prompts:/app/prompts:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      memory-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- memory
+  # The agent's long-term memory. Its own database rather than Temporal's: they
+  # have unrelated lifecycles, and clearing one must never mean clearing the
+  # other.
+  memory-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${SKYNET_DB_USER:?}
+      POSTGRES_PASSWORD: ${SKYNET_DB_PASSWORD:?}
+      POSTGRES_DB: skynet_memory
+    ports:
+      # 5433 on the host: 5432 is usually already taken on a dev machine.
+      - "${SKYNET_MEMORY_PORT:-5433}:5432"
+    volumes:
+      - memory-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SKYNET_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Applies the schema once, using *our* image, so the DDL lives in exactly one
+  # place. Not `docker-entrypoint-initdb.d`, which Postgres runs only when the
+  # data directory is empty -- a later migration would apply on a fresh laptop
+  # and never on an existing one.
+  memory-init:
+    image: skynet:local
+    pull_policy: never
+    command: ["python", "-m", "skynet.adapters.memory.bootstrap"]
+    environment:
+      <<: *skynet-env
+    depends_on:
+      memory-db:
+        condition: service_healthy
+    restart: "no"
+
+  # --------------------------------------------------------------- temporal
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${TEMPORAL_DB_USER:?}
+      POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD:?}
+      POSTGRES_SEEDS: temporal-db
+    ports:
+      - "${TEMPORAL_PORT:-7233}:7233"
+    depends_on:
+      temporal-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:2.32.0
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "${TEMPORAL_UI_PORT:-8233}:8080"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  temporal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${TEMPORAL_DB_USER:?}
+      POSTGRES_PASSWORD: ${TEMPORAL_DB_PASSWORD:?}
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEMPORAL_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- storage
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${SKYNET_STORAGE__ACCESS_KEY:?}
+      MINIO_ROOT_PASSWORD: ${SKYNET_STORAGE__SECRET_KEY:?}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set skynet http://minio:9000 ${SKYNET_STORAGE__ACCESS_KEY:?} ${SKYNET_STORAGE__SECRET_KEY:?} &&
+      mc mb --ignore-existing skynet/${SKYNET_STORAGE__BUCKET:-skynet} &&
+      echo 'bucket ready'
+      "
+    restart: "no"
+
+  # ------------------------------------------------- langfuse (opt-in only)
+  #
+  # Enable with:  docker compose --profile langfuse up -d
+  # Then create a project in the UI and set the resulting keys in .env:
+  #   SKYNET_TRACING__BACKEND=langfuse
+  #   SKYNET_PROMPTS__USE_LANGFUSE=true
+  langfuse-web:
+    profiles: ["langfuse"]
+    image: langfuse/langfuse:3
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://${LANGFUSE_DB_USER:?}:${LANGFUSE_DB_PASSWORD:?}@langfuse-db:5432/langfuse?schema=public
+      SALT: ${LANGFUSE_SALT:?}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?}
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_PORT:-3000}
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${SKYNET_STORAGE__BUCKET:-skynet}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${SKYNET_STORAGE__ACCESS_KEY:?}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${SKYNET_STORAGE__SECRET_KEY:?}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: langfuse/
+      # MinIO ignores the region, but the AWS SDK refuses to sign without one --
+      # and Langfuse turns that into an unhandled rejection that restarts the
+      # web process, which silently drops every incoming trace.
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-us-east-1}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${SKYNET_STORAGE__BUCKET:-skynet}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${SKYNET_STORAGE__ACCESS_KEY:?}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${SKYNET_STORAGE__SECRET_KEY:?}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-us-east-1}
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: langfuse-media/
+      # Provision org, project and keys on first boot so the stack is usable
+      # immediately and the keys are known ahead of time.
+      LANGFUSE_INIT_ORG_ID: skynet
+      LANGFUSE_INIT_ORG_NAME: Skynet
+      LANGFUSE_INIT_PROJECT_ID: skynet
+      LANGFUSE_INIT_PROJECT_NAME: Skynet
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${SKYNET_LANGFUSE__PUBLIC_KEY:?}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${SKYNET_LANGFUSE__SECRET_KEY:?}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_USER_EMAIL:-admin@skynet.local}
+      LANGFUSE_INIT_USER_NAME: Skynet Admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD:?}
+    ports:
+      - "${LANGFUSE_PORT:-3000}:3000"
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  langfuse-worker:
+    profiles: ["langfuse"]
+    image: langfuse/langfuse-worker:3
+    environment:
+      <<: *langfuse-env
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  langfuse-db:
+    profiles: ["langfuse"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${LANGFUSE_DB_USER:?}
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:?}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_DB_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  langfuse-clickhouse:
+    profiles: ["langfuse"]
+    image: clickhouse/clickhouse-server:24.12
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  langfuse-redis:
+    profiles: ["langfuse"]
+    image: redis:7-alpine
+    command: redis-server --save 60 1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # --------------------------------------- containerised ollama (optional)
+  #
+  # By default the harness talks to Ollama on the host. Use this only if you
+  # want the stack fully self-contained:
+  #   docker compose --profile ollama up -d
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  run-events:
+  memory-db-data:
+  temporal-db-data:
+  minio-data:
+  langfuse-db-data:
+  langfuse-clickhouse-data:
+  ollama-data:
